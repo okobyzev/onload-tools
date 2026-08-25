@@ -24,12 +24,15 @@ APP_ARGS=(1)
 ONLOAD_PROFILE="/profiles/latency-best-profile-core26.opf"
 TASKSET_CORE_SPEC="25,26"
 
-# Real filesystem locations the guard reads from. Overridable via env vars
-# so this script (and its checks) can be exercised in tests without root
-# or real Onload/Solarflare hardware - see tests/test_launcher.sh.
+# Real filesystem locations / commands the guard reads from. Overridable
+# via env vars so this script (and its checks) can be exercised in tests
+# without root or real Onload/Solarflare hardware - see tests/test_launcher.sh.
 STACKS_PROC="${STACKS_PROC:-/proc/driver/onload/stacks}"
 PROC_ROOT="${PROC_ROOT:-/proc}"
-SYS_CLASS_NET="${SYS_CLASS_NET:-/sys/class/net}"
+# `onload_mibdump -a llap` is Onload's own control-plane report of which
+# interfaces it has hwports assigned to - used instead of guessing from a
+# NIC driver name, which cannot be assumed to follow any fixed pattern.
+ONLOAD_MIBDUMP_CMD="${ONLOAD_MIBDUMP_CMD:-onload_mibdump}"
 INTERRUPTS_PROC="${INTERRUPTS_PROC:-/proc/interrupts}"
 IRQ_PROC_ROOT="${IRQ_PROC_ROOT:-/proc/irq}"
 
@@ -83,10 +86,13 @@ onload_guard::collect_stack_core_owners \
   "$STACKS_PROC" "$PROC_ROOT" STACK_CORE_OWNER ANY_LIVE_STACK
 
 onload_guard::collect_nic_irq_core_owners \
-  "$SYS_CLASS_NET" "$INTERRUPTS_PROC" "$IRQ_PROC_ROOT" IRQ_CORE_OWNER
+  "$ONLOAD_MIBDUMP_CMD" "$INTERRUPTS_PROC" "$IRQ_PROC_ROOT" IRQ_CORE_OWNER
 
 if [[ ! -r "$STACKS_PROC" ]]; then
   log "notice: $STACKS_PROC not present (onload module not loaded?) - no existing stacks to conflict with"
+fi
+if ! command -v "$ONLOAD_MIBDUMP_CMD" >/dev/null 2>&1; then
+  log "notice: '$ONLOAD_MIBDUMP_CMD' not found - skipping the NIC IRQ cross-check (stack-affinity check below still applies)"
 fi
 
 if onload_guard::check_conflicts \

@@ -18,9 +18,19 @@ core) it is about to claim are already owned by an existing Onload stack.
 
 The guard is deliberately generic:
 
-* **No assumption about stack/process naming.** Existing stacks are
-  discovered purely from the kernel-exposed `/proc/driver/onload/stacks`
-  table — whatever binary created them, whatever it's called.
+* **No reliance on any name at all** — process names, stack names, and NIC
+  driver names are all treated as arbitrary/random and never matched
+  against a pattern:
+  * Existing stacks are discovered purely from the kernel-exposed
+    `/proc/driver/onload/stacks` table (stack id + creator PID) — whatever
+    binary created them, whatever it's called.
+  * Which network interfaces are actually Onload-accelerated is asked
+    directly from Onload's own control plane (`onload_mibdump -a llap`,
+    which reports hwport assignment — a fact), instead of guessing from a
+    NIC driver name. There is no single reliable driver name to match:
+    Solarflare/AMD adapters alone span several driver module names across
+    generations, and Onload can also accelerate arbitrary AF_XDP-capable
+    NICs from any vendor.
 * **No hard-coded core IDs or IRQ numbers.** The cores this launch will use
   are extracted once, into script-local variables (`TASKSET_CORE_SPEC`,
   and whatever `EF_IRQ_CORE`/`EF_IRQ_CHANNEL` the profile file itself sets),
@@ -51,12 +61,15 @@ profile IRQ core):
    on a target core, that core is "owned" and the launch is blocked. A
    stack whose creator PID has exited (orphan/zombie) is not counted, since
    it can't run on any core anymore.
-2. **NIC IRQ steering** — auto-discover network interfaces bound to an
-   Onload-capable driver (`sfc*`), read their IRQs from `/proc/interrupts`
-   and each IRQ's live `smp_affinity_list`. If a target core is already
-   handling that NIC's interrupts *and* at least one Onload stack is
-   currently active anywhere on the host, the launch is blocked too (an
-   idle NIC IRQ with zero active stacks is not, by itself, a conflict).
+2. **NIC IRQ steering** — ask Onload's control plane (`onload_mibdump -a
+   llap`) which interfaces it currently has hwports assigned to, read
+   their IRQs from `/proc/interrupts` and each IRQ's live
+   `smp_affinity_list`. If a target core is already handling that NIC's
+   interrupts *and* at least one Onload stack is currently active anywhere
+   on the host, the launch is blocked too (an idle NIC IRQ with zero active
+   stacks is not, by itself, a conflict). If `onload_mibdump` is
+   unavailable, this check is skipped (logged as a notice) and check 1
+   above remains the primary, name-independent safety net.
 
 Any core with unrestricted affinity (e.g. `0-63`, meaning "not pinned")
 overlaps every target core by definition, so an existing, unpinned Onload
@@ -64,12 +77,12 @@ stack will also block the launch — this is intentional: on a host where
 specific cores must be dedicated, an unpinned stack could be scheduled onto
 them at any time.
 
-All filesystem paths the guard reads (`/proc/driver/onload/stacks`,
-`/proc`, `/sys/class/net`, `/proc/interrupts`, `/proc/irq`) are overridable
-via environment variables (`STACKS_PROC`, `PROC_ROOT`, `SYS_CLASS_NET`,
+All filesystem paths and commands the guard reads (`/proc/driver/onload/stacks`,
+`/proc`, `onload_mibdump`, `/proc/interrupts`, `/proc/irq`) are overridable
+via environment variables (`STACKS_PROC`, `PROC_ROOT`, `ONLOAD_MIBDUMP_CMD`,
 `INTERRUPTS_PROC`, `IRQ_PROC_ROOT`), which is how the test suite exercises
-every code path against a fake tree without root or real Onload/Solarflare
-hardware.
+every code path against fake fixtures — including a fake `onload_mibdump`
+stub — without root or real Onload/Solarflare hardware.
 
 ## Usage
 

@@ -5,16 +5,23 @@
 # already in use by another, currently running, Onload stack.
 #
 # Design notes (see README.md "Why this exists" for the full rationale):
-#   * We never assume a process/stack *name* pattern - any Onload stack,
-#     created by any binary, counts. Stacks are discovered purely from the
-#     kernel-exposed /proc/driver/onload/stacks table.
+#   * We never rely on any process, stack, thread or driver *name* pattern -
+#     names are arbitrary/random and cannot be assumed. Every fact used here
+#     comes from a structural, kernel- or control-plane-reported identifier
+#     instead: PIDs and Cpus_allowed_list from /proc/driver/onload/stacks +
+#     /proc/<pid>/task/*/status, and accelerated interfaces from Onload's
+#     own control plane (`onload_mibdump -a llap`, which reports hwport
+#     assignment - a fact, not a name guess) rather than matching a NIC
+#     driver name (there is no single reliable driver name: Solarflare/AMD
+#     adapters alone span several driver module names across generations,
+#     and Onload can also accelerate arbitrary AF_XDP-capable NICs).
 #   * We never hard-code core IDs or IRQ numbers - both are read at
 #     runtime, either from the caller-supplied taskset spec / profile file,
 #     or straight from the kernel (/proc/interrupts, /proc/irq/*).
-#   * Every path this file touches (/proc/driver/onload/stacks, /proc,
-#     /sys/class/net, /proc/interrupts) is overridable so the logic can be
-#     exercised against a fake filesystem tree in tests, without root and
-#     without real Onload/Solarflare hardware.
+#   * Every path/command this file touches (/proc/driver/onload/stacks,
+#     /proc, onload_mibdump, /proc/interrupts, /proc/irq) is overridable so
+#     the logic can be exercised against fake fixtures in tests, without
+#     root and without real Onload/Solarflare hardware.
 #
 # Intended usage: `source` this file, then call the onload_guard::* public
 # functions below. Nothing in this file launches a process or exits the
@@ -120,32 +127,82 @@ onload_guard::collect_stack_core_owners() {
 }
 
 # --------------------------------------------------------------------------
-# onload_guard::collect_nic_irq_core_owners <sys_class_net> <interrupts_proc> \
+# onload_guard::accelerated_ifaces <mibdump_cmd> <out_ifaces_array>
+#
+# Asks Onload's own control plane which network interfaces it currently has
+# hwports assigned to (i.e. which interfaces it is actually accelerating),
+# via the standard `onload_mibdump -a llap` report. This is a structural
+# fact reported by Onload itself, so it works regardless of NIC vendor,
+# driver module name/generation, or whether acceleration is via the native
+# ef_vi path or AF_XDP - unlike matching on a driver name pattern, which
+# cannot be assumed to be stable or even exist for a given adapter/driver.
+#
+# Sample input line format (see Onload's `llap` MIB dump):
+#   llap[000]: enp4s0f1 (650) UP mtu 1500 arp_base 30000ms
+#            TX hwports 1
+#            RX hwports 1
+#   llap[004]:       lo (1) UP mtu 65535 arp_base 30000ms
+#            no TX hwports
+#            no RX hwports
+#
+# Only interfaces with a non-empty ("no ... hwports") TX or RX hwport
+# assignment are considered accelerated and appended to <out_ifaces_array>.
+#
+# Returns 1 (without touching the output array) if the mibdump command is
+# unavailable or fails - callers must treat that as "unknown", not "none".
+# --------------------------------------------------------------------------
+onload_guard::accelerated_ifaces() {
+  local mibdump_cmd="$1"
+  local -n _out_ifaces="$2"
+
+  command -v "$mibdump_cmd" >/dev/null 2>&1 || return 1
+  local output
+  output="$("$mibdump_cmd" -a llap 2>/dev/null)" || return 1
+
+  local line cur_iface="" accelerated=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^llap\[[0-9]+\]:[[:space:]]+([^[:space:]]+)[[:space:]]+\( ]]; then
+      if [[ -n "$cur_iface" && "$accelerated" == "1" ]]; then
+        _out_ifaces+=("$cur_iface")
+      fi
+      cur_iface="${BASH_REMATCH[1]}"
+      accelerated=0
+    elif [[ "$line" =~ (TX|RX)[[:space:]]+hwports[[:space:]]+[0-9] ]]; then
+      accelerated=1
+    fi
+  done <<<"$output"
+  if [[ -n "$cur_iface" && "$accelerated" == "1" ]]; then
+    _out_ifaces+=("$cur_iface")
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# onload_guard::collect_nic_irq_core_owners <mibdump_cmd> <interrupts_proc> \
 #                                            <irq_proc_root> <out_owner_map>
 #
-# Auto-discovers network interfaces bound to an Onload-capable NIC driver
-# (Solarflare/AMD "sfc*"), finds their IRQ numbers from <interrupts_proc>,
-# and reads each IRQ's *current* smp_affinity_list from <irq_proc_root>
-# (normally /proc/irq) - never a hard-coded IRQ number.
+# For every interface Onload reports as accelerated (see
+# onload_guard::accelerated_ifaces above), finds its IRQ numbers from
+# <interrupts_proc> and reads each IRQ's *current* smp_affinity_list from
+# <irq_proc_root> (normally /proc/irq) - never a hard-coded IRQ number.
 #
 # <out_owner_map> is filled as: owner_map[<core>]="irq=<n> if=<iface>"
+# If Onload's accelerated-interface list cannot be determined (mibdump
+# missing/failed), this is a no-op: the stack-affinity check remains the
+# primary, name-independent safety net either way.
 # --------------------------------------------------------------------------
 onload_guard::collect_nic_irq_core_owners() {
-  local sys_class_net="$1" interrupts_proc="$2" irq_proc_root="$3"
+  local mibdump_cmd="$1" interrupts_proc="$2" irq_proc_root="$3"
   local -n _irq_owner_map="$4"
 
-  [[ -d "$sys_class_net" ]] || return 0
   [[ -r "$interrupts_proc" ]] || return 0
 
-  local netdev iface driver_path driver irq_line irq aff_file aff core
-  for netdev in "$sys_class_net"/*; do
-    [[ -e "$netdev" ]] || continue
-    iface="$(basename "$netdev")"
-    driver_path="$netdev/device/driver"
-    [[ -e "$driver_path" ]] || continue
-    driver="$(basename "$(readlink -f "$driver_path")")"
-    [[ "$driver" == sfc* ]] || continue
+  local -a ifaces=()
+  onload_guard::accelerated_ifaces "$mibdump_cmd" ifaces || return 0
+  ((${#ifaces[@]} > 0)) || return 0
 
+  local iface irq_line irq aff_file aff core
+  for iface in "${ifaces[@]}"; do
     while IFS= read -r irq_line; do
       irq="${irq_line%%:*}"
       irq="${irq//[[:space:]]/}"
