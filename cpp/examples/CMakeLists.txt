@@ -1,0 +1,3 @@
+add_executable(launch_check_example launch_check_example.cpp)
+target_link_libraries(launch_check_example PRIVATE onload_guard::onload_guard)
+target_compile_options(launch_check_example PRIVATE -Wall -Wextra)
