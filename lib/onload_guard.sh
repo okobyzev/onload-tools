@@ -58,6 +58,22 @@ onload_guard::expand_core_list() {
 }
 
 # --------------------------------------------------------------------------
+# onload_guard::all_cores <cpuinfo_proc>
+#
+# Returns every CPU core id present on the host (one per line, sorted+
+# unique), read from the kernel-reported "processor" fields in
+# <cpuinfo_proc> (normally /proc/cpuinfo) - a structural fact, so this
+# works on any host without hard-coding a core count or calling `nproc`
+# (which only reports the *online* count and can't be pointed at a fake
+# fixture for tests).
+# --------------------------------------------------------------------------
+onload_guard::all_cores() {
+  local cpuinfo="${1:-}"
+  [[ -n "$cpuinfo" && -r "$cpuinfo" ]] || return 0
+  awk -F: '/^processor[[:space:]]*:/ { gsub(/[ \t]/, "", $2); print $2 }' "$cpuinfo" | sort -nu
+}
+
+# --------------------------------------------------------------------------
 # onload_guard::cores_from_profile <profile_file>
 #
 # Onload tuning profiles (.opf) can dedicate interrupt handling to a core
@@ -178,13 +194,39 @@ onload_guard::accelerated_ifaces() {
 }
 
 # --------------------------------------------------------------------------
+# onload_guard::iface_irqs <iface> <interrupts_proc> <out_irqs_array>
+#
+# Looks up every IRQ number <interrupts_proc> (normally /proc/interrupts)
+# reports for <iface> - never a hard-coded IRQ number - and appends them to
+# <out_irqs_array>. Factored out of onload_guard::collect_nic_irq_core_owners
+# so any caller (this file's own conflict check, or a resource-listing
+# tool) can enumerate an interface's actual IRQ channels without
+# duplicating the parsing.
+# --------------------------------------------------------------------------
+onload_guard::iface_irqs() {
+  local iface="$1" interrupts_proc="$2"
+  local -n _out_irqs="$3"
+
+  [[ -r "$interrupts_proc" ]] || return 0
+
+  local irq_line irq
+  while IFS= read -r irq_line; do
+    irq="${irq_line%%:*}"
+    irq="${irq//[[:space:]]/}"
+    [[ "$irq" =~ ^[0-9]+$ ]] || continue
+    _out_irqs+=("$irq")
+  done < <(grep -F "$iface" "$interrupts_proc" || true)
+}
+
+# --------------------------------------------------------------------------
 # onload_guard::collect_nic_irq_core_owners <mibdump_cmd> <interrupts_proc> \
 #                                            <irq_proc_root> <out_owner_map>
 #
 # For every interface Onload reports as accelerated (see
-# onload_guard::accelerated_ifaces above), finds its IRQ numbers from
-# <interrupts_proc> and reads each IRQ's *current* smp_affinity_list from
-# <irq_proc_root> (normally /proc/irq) - never a hard-coded IRQ number.
+# onload_guard::accelerated_ifaces above), finds its IRQ numbers (see
+# onload_guard::iface_irqs above) and reads each IRQ's *current*
+# smp_affinity_list from <irq_proc_root> (normally /proc/irq) - never a
+# hard-coded IRQ number.
 #
 # <out_owner_map> is filled as: owner_map[<core>]="irq=<n> if=<iface>"
 # If Onload's accelerated-interface list cannot be determined (mibdump
@@ -201,12 +243,12 @@ onload_guard::collect_nic_irq_core_owners() {
   onload_guard::accelerated_ifaces "$mibdump_cmd" ifaces || return 0
   ((${#ifaces[@]} > 0)) || return 0
 
-  local iface irq_line irq aff_file aff core
+  local iface irq aff_file aff core
+  local -a irqs
   for iface in "${ifaces[@]}"; do
-    while IFS= read -r irq_line; do
-      irq="${irq_line%%:*}"
-      irq="${irq//[[:space:]]/}"
-      [[ "$irq" =~ ^[0-9]+$ ]] || continue
+    irqs=()
+    onload_guard::iface_irqs "$iface" "$interrupts_proc" irqs
+    for irq in "${irqs[@]}"; do
       aff_file="$irq_proc_root/$irq/smp_affinity_list"
       [[ -r "$aff_file" ]] || continue
       aff=$(<"$aff_file")
@@ -214,7 +256,7 @@ onload_guard::collect_nic_irq_core_owners() {
         [[ -n "$core" ]] || continue
         _irq_owner_map["$core"]="irq=$irq if=$iface"
       done < <(onload_guard::expand_core_list "$aff")
-    done < <(grep -F "$iface" "$interrupts_proc" || true)
+    done
   done
 }
 
